@@ -57,6 +57,7 @@ set(RECOMPILER_SOURCES
     tools/recompiler/src/main.cpp
     tools/recompiler/src/sh4_disasm.cpp
     tools/recompiler/src/ir_emitter.cpp
+    tools/recompiler/src/dc_disc.cpp
 )
 
 add_executable(dc-recomp ${RECOMPILER_SOURCES})

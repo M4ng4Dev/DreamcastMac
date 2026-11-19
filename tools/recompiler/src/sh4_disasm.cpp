@@ -267,18 +267,25 @@ std::vector<FunctionBlock> SH4Disassembler::analyze(
     const std::set<uint32_t>& entry_points
 ) {
     std::vector<FunctionBlock> functions;
-    std::set<uint32_t> visited_blocks;
+    std::set<uint32_t> discovered_funcs;
     std::queue<uint32_t> pending_functions;
 
     for (uint32_t ep : entry_points) {
-        pending_functions.push(ep);
+        if (discovered_funcs.insert(ep).second) {
+            pending_functions.push(ep);
+        }
     }
 
-    while (!pending_functions.empty()) {
+    const size_t MAX_FUNCTIONS = 50000;
+    const size_t MAX_BLOCKS_PER_FUNC = 4096;
+
+    while (!pending_functions.empty() && functions.size() < MAX_FUNCTIONS) {
         uint32_t func_pc = pending_functions.front();
         pending_functions.pop();
 
-        if (visited_blocks.count(func_pc) > 0) continue;
+        if (func_pc < base_address || (func_pc - base_address + 2) > code_size) {
+            continue;
+        }
 
         FunctionBlock func;
         func.entry_pc = func_pc;
@@ -286,40 +293,92 @@ std::vector<FunctionBlock> SH4Disassembler::analyze(
         ss << "func_0x" << std::hex << func_pc;
         func.name = ss.str();
 
-        BasicBlock current_bb;
-        current_bb.start_pc = func_pc;
-        uint32_t curr_pc = func_pc;
+        std::set<uint32_t> visited_block_starts;
+        std::queue<uint32_t> pending_blocks;
+        pending_blocks.push(func_pc);
+        visited_block_starts.insert(func_pc);
 
-        while (true) {
-            if (curr_pc < base_address || (curr_pc - base_address + 2) > code_size) {
-                break;
+        while (!pending_blocks.empty() && func.blocks.size() < MAX_BLOCKS_PER_FUNC) {
+            uint32_t bb_start = pending_blocks.front();
+            pending_blocks.pop();
+
+            if (bb_start < base_address || (bb_start - base_address + 2) > code_size) {
+                continue;
             }
 
-            uint32_t offset = curr_pc - base_address;
-            uint16_t op = static_cast<uint16_t>(code_bytes[offset] | (code_bytes[offset + 1] << 8));
-            DecodedInstruction inst = decode(curr_pc, op);
-            current_bb.instructions.push_back(inst);
-            visited_blocks.insert(curr_pc);
-            curr_pc += 2;
+            BasicBlock current_bb{};
+            current_bb.start_pc = bb_start;
+            uint32_t curr_pc = bb_start;
+            const size_t MAX_INSTS_PER_BLOCK = 2048;
 
-            if (inst.is_branch) {
-                if (inst.has_delay_slot && (curr_pc - base_address + 2) <= code_size) {
-                    uint32_t delay_offset = curr_pc - base_address;
-                    uint16_t delay_op = static_cast<uint16_t>(code_bytes[delay_offset] | (code_bytes[delay_offset + 1] << 8));
-                    DecodedInstruction delay_inst = decode(curr_pc, delay_op);
-                    current_bb.instructions.push_back(delay_inst);
-                    visited_blocks.insert(curr_pc);
-                    curr_pc += 2;
+            while (current_bb.instructions.size() < MAX_INSTS_PER_BLOCK) {
+                if (curr_pc < base_address || (curr_pc - base_address + 2) > code_size) {
+                    break;
                 }
 
+                uint32_t offset = curr_pc - base_address;
+                uint16_t op = static_cast<uint16_t>(code_bytes[offset] | (code_bytes[offset + 1] << 8));
+                DecodedInstruction inst = decode(curr_pc, op);
+                current_bb.instructions.push_back(inst);
+                curr_pc += 2;
+
+                if (inst.is_branch) {
+                    if (inst.has_delay_slot && (curr_pc - base_address + 2) <= code_size) {
+                        uint32_t delay_offset = curr_pc - base_address;
+                        uint16_t delay_op = static_cast<uint16_t>(code_bytes[delay_offset] | (code_bytes[delay_offset + 1] << 8));
+                        DecodedInstruction delay_inst = decode(curr_pc, delay_op);
+                        current_bb.instructions.push_back(delay_inst);
+                        curr_pc += 2;
+                    }
+
+                    current_bb.end_pc = curr_pc;
+
+                    if (inst.type == OpcodeType::BSR) {
+                        if (inst.target_pc >= base_address && (inst.target_pc - base_address + 2) <= code_size) {
+                            if (discovered_funcs.insert(inst.target_pc).second) {
+                                pending_functions.push(inst.target_pc);
+                            }
+                        }
+                        // Execution continues after BSR + delay slot
+                        if (visited_block_starts.insert(curr_pc).second) {
+                            pending_blocks.push(curr_pc);
+                        }
+                    } else if (inst.type == OpcodeType::JSR) {
+                        // Indirect call, execution continues after JSR + delay slot
+                        if (visited_block_starts.insert(curr_pc).second) {
+                            pending_blocks.push(curr_pc);
+                        }
+                    } else if (inst.type == OpcodeType::BT || inst.type == OpcodeType::BF ||
+                               inst.type == OpcodeType::BT_S || inst.type == OpcodeType::BF_S) {
+                        // Conditional branch: follow both target and fallthrough
+                        if (inst.target_pc >= base_address && (inst.target_pc - base_address + 2) <= code_size) {
+                            current_bb.successors.push_back(inst.target_pc);
+                            if (visited_block_starts.insert(inst.target_pc).second) {
+                                pending_blocks.push(inst.target_pc);
+                            }
+                        }
+                        current_bb.successors.push_back(curr_pc);
+                        if (visited_block_starts.insert(curr_pc).second) {
+                            pending_blocks.push(curr_pc);
+                        }
+                    } else if (inst.type == OpcodeType::BRA) {
+                        if (inst.target_pc >= base_address && (inst.target_pc - base_address + 2) <= code_size) {
+                            current_bb.successors.push_back(inst.target_pc);
+                            if (visited_block_starts.insert(inst.target_pc).second) {
+                                pending_blocks.push(inst.target_pc);
+                            }
+                        }
+                    }
+                    // RTS / JMP terminate the basic block path
+                    break;
+                }
+            }
+
+            if (current_bb.end_pc == 0) {
                 current_bb.end_pc = curr_pc;
+            }
+            if (!current_bb.instructions.empty()) {
                 func.blocks.push_back(current_bb);
-
-                // If BSR / JSR branch, push destination function to discover
-                if (inst.type == OpcodeType::BSR && inst.target_pc != 0) {
-                    pending_functions.push(inst.target_pc);
-                }
-                break;
             }
         }
 
