@@ -1,0 +1,25 @@
+# Build directories
+build/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.ninja
+.ninja_*
+
+# macOS files
+.DS_Store
+*.xcodeproj/
+DerivedData/
+
+# Sample temporary binaries
+sample_sh4.bin
+recompiled_game.cpp
